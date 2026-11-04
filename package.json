@@ -1,0 +1,44 @@
+{
+	"name": "@awilixify/kysely",
+	"version": "0.1.0",
+	"description": "Module-scoped Kysely read/write access for awilixify",
+	"type": "module",
+	"license": "MIT",
+	"main": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": ["dist", "README.md", "LICENSE"],
+	"sideEffects": false,
+	"publishConfig": { "access": "public" },
+	"engines": { "node": ">=22" },
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"build:watch": "tsc -p tsconfig.build.json --watch",
+		"build:release": "npm run lint && npm run check-types && npm test && npm run build",
+		"check-types": "tsc --noEmit",
+		"lint": "biome check index.ts lib test",
+		"lint:fix": "biome check --write index.ts lib test",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"prepack": "npm run build:release"
+	},
+	"peerDependencies": {
+		"awilixify": "^3.4.0",
+		"kysely": "^0.29.8"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.6.4",
+		"@types/node": "^22.15.21",
+		"awilix": "^13.0.0",
+		"awilixify": "^3.4.0",
+		"kysely": "^0.29.8",
+		"typescript": "^5.9.3",
+		"vitest": "^5.0.5"
+	},
+	"keywords": ["awilixify", "kysely", "dependency-injection", "sql", "typescript"]
+}
