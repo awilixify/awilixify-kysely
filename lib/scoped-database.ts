@@ -1,17 +1,15 @@
 import type {
-	AccessMode,
-	DeleteQueryBuilder,
-	DeleteResult,
-	InsertQueryBuilder,
-	InsertResult,
-	IsolationLevel,
 	Kysely,
-	TransactionBuilder,
-	UpdateQueryBuilder,
-	UpdateResult,
+	KyselyPlugin,
+	SimpleTableReference,
+	TableExpression,
 } from "kysely";
+import type { ScopedConnections } from "./scoped-connections.js";
+import type { ScopedCtes } from "./scoped-ctes.js";
+import type { ScopedTransactions } from "./scoped-transactions.js";
 
-export type TableName<DB> = Extract<keyof DB, string>;
+// Kysely table names are strings; exclude numeric and symbol keys from keyof DB.
+export type TableName<DB> = keyof DB & string;
 
 export type TableScope<
 	DB,
@@ -22,45 +20,66 @@ export type TableScope<
 	writeTables: readonly Write[];
 };
 
-export type ScopedTransaction<
-	DB,
-	Read extends TableName<DB>,
-	Write extends Read,
-> = Pick<Kysely<Pick<DB, Read>>, "selectFrom"> & {
+// Narrow named targets only. Intersecting schemas also intersects callback
+// signatures, which prevents contextual inference of their expression builder.
+type WriteTarget<DB, Write extends TableName<DB>> =
+	| SimpleTableReference<Pick<DB, Write>>
+	| Exclude<TableExpression<DB, never>, string>;
+
+type WriteTargets<DB, Write extends TableName<DB>> =
+	| WriteTarget<DB, Write>
+	| ReadonlyArray<WriteTarget<DB, Write>>;
+
+// Reuse native generic return types to retain alias and result inference.
+declare function scopedMutations<DB, Write extends TableName<DB>>(
+	native: Kysely<DB>,
+): {
 	insertInto<Table extends Write>(
 		table: Table,
-	): InsertQueryBuilder<Pick<DB, Read>, Table, InsertResult>;
-	updateTable<Table extends Write>(
+	): ReturnType<typeof native.insertInto<Table>>;
+	replaceInto<Table extends Write>(
 		table: Table,
-	): UpdateQueryBuilder<Pick<DB, Read>, Table, Table, UpdateResult>;
-	deleteFrom<Table extends Write>(
+	): ReturnType<typeof native.replaceInto<Table>>;
+
+	mergeInto<Table extends SimpleTableReference<Pick<DB, Write>>>(
 		table: Table,
-	): DeleteQueryBuilder<Pick<DB, Read>, Table, DeleteResult>;
+	): ReturnType<typeof native.mergeInto<Table>>;
+
+	updateTable<Target extends WriteTargets<DB, Write>>(
+		target: Target,
+	): ReturnType<typeof native.updateTable<Target>>;
+
+	deleteFrom<Target extends WriteTargets<DB, Write>>(
+		target: Target,
+	): ReturnType<typeof native.deleteFrom<Target>>;
 };
 
-export interface ScopedTransactionBuilder<
-	DB,
-	Read extends TableName<DB>,
-	Write extends Read,
-> {
-	setAccessMode(
-		accessMode: AccessMode,
-	): ScopedTransactionBuilder<DB, Read, Write>;
-	setIsolationLevel(
-		isolationLevel: IsolationLevel,
-	): ScopedTransactionBuilder<DB, Read, Write>;
-	execute<T>(
-		callback: (trx: ScopedTransaction<DB, Read, Write>) => Promise<T>,
-	): Promise<T>;
-}
+export type ScopedMutations<DB, Write extends TableName<DB>> = ReturnType<
+	typeof scopedMutations<DB, Write>
+>;
 
 export type ScopedDatabase<
 	DB,
 	Read extends TableName<DB>,
 	Write extends Read,
-> = ScopedTransaction<DB, Read, Write> & {
-	transaction(): ScopedTransactionBuilder<DB, Read, Write>;
-};
+> = Omit<
+	Kysely<Pick<DB, Read>>,
+	| keyof ScopedMutations<DB, Write>
+	| keyof ScopedTransactions<DB, Write>
+	| keyof ScopedConnections<DB, Write>
+	| keyof ScopedCtes<DB, Write>
+	| "withSchema"
+	| "withPlugin"
+	| "withoutPlugins"
+> &
+	ScopedMutations<Pick<DB, Read>, Write> &
+	ScopedTransactions<Pick<DB, Read>, Write> &
+	ScopedConnections<Pick<DB, Read>, Write> &
+	ScopedCtes<Pick<DB, Read>, Write> & {
+		withSchema(schema: string): ScopedDatabase<DB, Read, Write>;
+		withPlugin(plugin: KyselyPlugin): ScopedDatabase<DB, Read, Write>;
+		withoutPlugins(): ScopedDatabase<DB, Read, Write>;
+	};
 
 export function createScopedDatabase<
 	DB,
@@ -70,66 +89,12 @@ export function createScopedDatabase<
 	db: Kysely<DB>,
 	scope: TableScope<DB, Read, Write>,
 ): ScopedDatabase<DB, Read, Write> {
-	const readable = new Set<string>(scope.readTables);
-	const writable = new Set<string>(scope.writeTables);
-
-	for (const table of writable) {
-		if (!readable.has(table)) {
+	for (const table of scope.writeTables) {
+		if (!scope.readTables.includes(table)) {
 			throw new Error(`Writable table "${table}" must also be readable`);
 		}
 	}
 
-	function assertWritable(table: string) {
-		if (!writable.has(table)) {
-			throw new Error(`Table "${table}" is not writable in this module`);
-		}
-	}
-
-	function queries(
-		database: Kysely<Pick<DB, Read>>,
-	): ScopedTransaction<DB, Read, Write> {
-		return {
-			selectFrom: database.selectFrom.bind(database),
-			insertInto<Table extends Write>(table: Table) {
-				assertWritable(table);
-				return database.insertInto(table);
-			},
-			updateTable<Table extends Write>(table: Table) {
-				assertWritable(table);
-				// Literal targets exclude Kysely's alias and multi-table return branches.
-				return database.updateTable(table) as unknown as UpdateQueryBuilder<
-					Pick<DB, Read>,
-					Table,
-					Table,
-					UpdateResult
-				>;
-			},
-			deleteFrom<Table extends Write>(table: Table) {
-				assertWritable(table);
-				return database.deleteFrom(table) as unknown as DeleteQueryBuilder<
-					Pick<DB, Read>,
-					Table,
-					DeleteResult
-				>;
-			},
-		};
-	}
-
-	function transaction(
-		builder: TransactionBuilder<Pick<DB, Read>>,
-	): ScopedTransactionBuilder<DB, Read, Write> {
-		return {
-			setAccessMode: (mode) => transaction(builder.setAccessMode(mode)),
-			setIsolationLevel: (level) =>
-				transaction(builder.setIsolationLevel(level)),
-			execute: (callback) => builder.execute((trx) => callback(queries(trx))),
-		};
-	}
-
-	// Narrow the schema without changing the shared driver or connection pool.
-	const scopedDb = db as unknown as Kysely<Pick<DB, Read>>;
-	return {
-		...queries(scopedDb),
-		transaction: () => transaction(scopedDb.transaction()),
-	};
+	// Only the TypeScript view changes; the original instance is untouched.
+	return db as unknown as ScopedDatabase<DB, Read, Write>;
 }

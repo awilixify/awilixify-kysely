@@ -1,13 +1,2 @@
-export {
-	createKyselyModuleFactory,
-	type KyselyModuleFactory,
-	type KyselyRootModuleDef,
-	type KyselyScopeModuleDef,
-} from "./lib/kysely-module.js";
-export type {
-	ScopedDatabase,
-	ScopedTransaction,
-	ScopedTransactionBuilder,
-	TableName,
-	TableScope,
-} from "./lib/scoped-database.js";
+export { createKyselyModuleFactory } from "./lib/kysely-module.js";
+export type { ScopedDatabase } from "./lib/scoped-database.js";

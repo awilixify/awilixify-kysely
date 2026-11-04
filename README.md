@@ -1,8 +1,6 @@
 # @awilixify/kysely
 
-Module-scoped Kysely access for awilixify. Share one database instance and pool while giving each feature module its own readable tables and mutation targets.
-
-Requires Node.js 22+, awilixify 3.4+, and Kysely 0.29.8+. ESM only. Direct factories work with awilixify 3.4.0; wrapping a callable factory with `configureModule` requires the callable-factory support added alongside this package, which is not yet in the published 3.4.0 release.
+Module-scoped Kysely types for awilixify. Keep Kysely's full API while catching common table-access mistakes at compile time.
 
 ## Install
 
@@ -12,9 +10,9 @@ npm install @awilixify/kysely awilixify awilix kysely
 
 Install your dialect's driver separately, for example `pg` and the development dependency `@types/pg` for PostgreSQL. This package does not depend on a database driver.
 
-## Create the dynamic module factory
+## Create the module factory
 
-The application creates and owns its Kysely instance. Database types remain application-owned too.
+The application creates and owns the Kysely instance and its database types:
 
 ```ts
 import { createKyselyModuleFactory } from "@awilixify/kysely";
@@ -35,7 +33,7 @@ const db = new Kysely<Database>({
 export const DatabaseModule = createKyselyModuleFactory({ db });
 ```
 
-`DatabaseModule` is both a root module exporting `db` and a callable dynamic-module factory. Each call returns an ordinary module exporting one restricted `db` provider:
+Each feature declares its readable tables and writable targets:
 
 ```ts
 import { createModule, type ModuleDef } from "awilixify";
@@ -53,13 +51,37 @@ export const PostsModule = createModule<PostsDef>({
   imports: [PostsDatabaseModule],
 });
 
-// PostsDef["deps"]["db"] is ScopedDatabase<Database, "posts" | "users", "posts">.
-// Reads may reference posts and users; mutation targets must be posts.
+async function publish({ scopedDb }: PostsDef["deps"]) {
+  await scopedDb.updateTable("posts").set({ published: true }).execute();
+  await scopedDb.selectFrom("users").select("id").execute();
+  // scopedDb.updateTable("users"); // Type error: readable, but not writable.
+}
 ```
 
-Each scope wraps the same captured Kysely instance, without creating another instance or pool. It does not import the unrestricted root provider. Importing `DatabaseModule` itself deliberately gives full `Kysely<Database>` access; importing `DatabaseModule({ ... })` gives `ScopedDatabase` access under the same `db` name.
+Every scoped module exports `scopedDb`. It is the **same original Kysely instance**, not a proxy, wrapper, copy, or new connection pool. Only its TypeScript view changes. No native method is replaced or hidden.
 
-Use one database scope per feature module. Importing several scopes, or both the root and a scope, into the same consumer would collide on `db`. Import feature modules without re-exporting their database providers.
+- Importing `DatabaseModule` directly exports `rootDb: Kysely<Database>`.
+- Importing `DatabaseModule({ ... })` exports `scopedDb: ScopedDatabase<...>`.
+
+## Custom provider names
+
+Use flat options to choose the exact exported keys, for example when importing two databases:
+
+```ts
+const OrdersModule = createKyselyModuleFactory({
+  db: ordersDb,
+  rootProviderName: "orders",
+  scopedProviderName: "orderQueries",
+});
+
+const AnalyticsModule = createKyselyModuleFactory({
+  db: analyticsDb,
+  rootProviderName: "analytics",
+  scopedProviderName: "eventQueries",
+});
+```
+
+Root imports now export `orders` and `analytics`; scoped imports export `orderQueries` and `eventQueries`. Omitted options keep `rootDb` and `scopedDb`
 
 ## Configure the factory explicitly
 
@@ -82,70 +104,35 @@ export const DatabaseModule = configureModule({
 });
 ```
 
-`ConfigModule` is your application's module exporting `config`. Feature modules still call `DatabaseModule({ readTables, writeTables })` as shown above. The generic database type and table allowlists are preserved.
+## Type constraints
 
-Calls to a configured factory are deferred until `DIContext.create()`. Reuse the same `DatabaseModule` descriptor so the factory and database initialize once per context. The Kysely package itself never calls `configureModule` or hides configuration in another overload. As with `configureModule` generally, this configured form uses synchronous `DIContext`, not `AsyncDIContext`.
+- `readTables` determines the schema available to normal typed queries, joins, subqueries, and expression helpers.
+- `writeTables` narrows named targets of `insertInto`, `replaceInto`, `mergeInto`, `updateTable`, and `deleteFrom`. Every writable table must also be readable.
+- An empty `writeTables` array allows no named mutation targets.
+- `with()` and `withRecursive()` preserve permissions in callbacks and chained queries. CTE names are readable-only, even when shadowing a writable table; mutation CTEs may write to tables in `writeTables`.
 
-## Permissions
+### Type-safety limits
 
-- `readTables` determines the schema available to selects, joins, and subqueries.
-- `writeTables` determines the allowed insert, update, and delete targets. Every writable table must also be readable.
-- An empty `writeTables` array gives no mutation targets.
-- Read queries support Kysely's normal table aliases. Mutation entry points accept registered table names only, not aliases, raw expressions, or multiple targets.
+All typed query APIs on `scopedDb` preserve scoped permissions, including transactions, connections, CTEs, and schema/plugin chains, except:
 
-An update can read another permitted table without being allowed to mutate it:
+- `$extendTables()`, `$pickTables()`, `$omitTables()`, and legacy `withTables()` return native types without scoped write restrictions.
+- Raw SQL, `executeQuery()`, `getExecutor()`, and dynamic or expression-based mutation targets bypass named-table checks.
+- Native schema-management and introspection APIs remain unrestricted.
 
-```ts
-async function publishPosts({ db }: PostsDef["deps"]) {
-  await db
-    .updateTable("posts")
-    .set({ published: true })
-    .where((eb) =>
-      eb.exists(
-        eb.selectFrom("users")
-          .select("users.id")
-          .whereRef("users.id", "=", "posts.authorId")
-          .where("users.active", "=", true),
-      ),
-    )
-    .execute();
+`withSchema()` and plugins retain the scoped types but can redirect or transform SQL. Unsafe casts also bypass type checks.
 
-  // db.updateTable("users"); // Type error
-}
-```
-
-## Transactions
-
-The scoped `db` exposes callback-based transactions. Both table permissions are preserved inside the callback:
-
-```ts
-async function publishAtomically({ db }: PostsDef["deps"]) {
-  return db.transaction()
-    .setIsolationLevel("serializable")
-    .execute(async (trx) => {
-      await trx.selectFrom("users").select("id").execute();
-      await trx.updateTable("posts").set({ published: true }).execute();
-      // trx.updateTable("users"); // Type error
-      return "published";
-    });
-}
-```
-
-`setAccessMode` is also supported. Callback results, commits, and rollbacks use Kysely's normal behavior. The transaction callback receives a `ScopedTransaction`, not the full Kysely transaction. Nested and manually controlled transactions are not exposed.
-
-The package exports `ScopedDatabase`, `ScopedTransaction`, and `ScopedTransactionBuilder` types for explicit annotations. Schema management, lifecycle, and unrestricted connection APIs remain root-only.
-
-## Runtime limits
-
-Scope creation checks that writable tables are readable. Mutation entry points also check their target against a copied allowlist at runtime, including calls from JavaScript or through unsafe casts.
-
-This version does **not** include a query-tree permission plugin. Read restrictions are compile-time only. Builders retain Kysely's raw-expression support and advanced dialect-specific methods; those are not a sandbox. Raw SQL, unsafe casts, views, triggers, functions, or dialect-specific multi-table mutations can bypass the intended boundaries. CTE, schema-management, and unrestricted connection-management entry points are not exposed. Callback transactions retain the same runtime mutation-target checks.
-
-These permissions prevent ordinary application mistakes. Use database grants for security enforcement.
+These are compile-time guardrails, not runtime authorization. Use database roles and grants to enforce access.
 
 ## Lifecycle
 
-All scoped databases and transactions use the supplied database's driver and pool. The package never calls `destroy()`. The owning application must call `db.destroy()` once during shutdown, after database work has finished. For a DI-created instance, arrange that cleanup in its owning provider's shutdown hook.
+`destroyOnShutdown` defaults to `true`: the root module calls `db.destroy()` once per context during `onShutdown`. Use `await context.init()` and `await context.close()`. Disable cleanup if another owner manages the database:
+
+```ts
+const DatabaseModule = createKyselyModuleFactory({
+  db,
+  destroyOnShutdown: false,
+});
+```
 
 ## Development
 
@@ -156,7 +143,3 @@ npm run check-types
 npm test
 npm run build
 ```
-
-Uses TypeScript, Biome, and Vitest, matching awilixify's tooling. `check-types` also checks the negative permission cases in `test/permissions.types.ts` using `@ts-expect-error`. Tests use Kysely's dummy driver and need no database server.
-
-`npm pack` runs lint, type checks, tests, and build before packaging. The package is independent of the sibling awilixify checkout and uses the published peer dependency. Callable `configureModule` behavior is tested in awilixify itself; the package tests exercise the ordinary root and scoped modules.
